@@ -28,6 +28,7 @@ pub mod canvas;
 mod chart;
 mod clear;
 mod gauge;
+mod histogram;
 mod list;
 mod paragraph;
 mod reflow;
@@ -46,6 +47,7 @@ pub use self::{
     chart::{Axis, Chart, Dataset, GraphType},
     clear::Clear,
     gauge::{Gauge, LineGauge},
+    histogram::Histogram,
     list::{List, ListItem, ListState},
     paragraph::{Paragraph, Wrap},
     scrollbar::{ScrollDirection, Scrollbar, ScrollbarOrientation, ScrollbarState},
