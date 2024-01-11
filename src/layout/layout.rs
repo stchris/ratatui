@@ -457,17 +457,11 @@ impl Layout {
         // apply the constraints
         for (&constraint, &element) in layout.constraints.iter().zip(elements.iter()) {
             match constraint {
-                Constraint::Percentage(p) => {
-                    let percent = f64::from(p) / 100.00;
-                    solver.add_constraint(element.size() | EQ(STRONG) | (area_size * percent))?;
-                }
-                Constraint::Ratio(n, d) => {
-                    // avoid division by zero by using 1 when denominator is 0
-                    let ratio = f64::from(n) / f64::from(d.max(1));
-                    solver.add_constraint(element.size() | EQ(STRONG) | (area_size * ratio))?;
-                }
-                Constraint::Length(l) => {
-                    solver.add_constraint(element.size() | EQ(STRONG) | f64::from(l))?
+                Constraint::Fixed(l) => {
+                    // when fixed is used, element size matching value provided will be the first
+                    // priority. We use `REQUIRED - 1` instead `REQUIRED` because we don't want
+                    // it to panic in cases when it cannot.
+                    solver.add_constraint(element.size() | EQ(REQUIRED - 1.0) | f64::from(l))?
                 }
                 Constraint::Max(m) => {
                     solver.add_constraints(&[
@@ -481,6 +475,73 @@ impl Layout {
                         element.size() | EQ(MEDIUM) | f64::from(m),
                     ])?;
                 }
+                Constraint::Length(l) => {
+                    solver.add_constraint(element.size() | EQ(STRONG) | f64::from(l))?
+                }
+                Constraint::Percentage(p) => {
+                    let percent = f64::from(p) / 100.00;
+                    solver.add_constraint(element.size() | EQ(STRONG) | (area_size * percent))?;
+                }
+                Constraint::Ratio(n, d) => {
+                    // avoid division by zero by using 1 when denominator is 0
+                    let ratio = f64::from(n) / f64::from(d.max(1));
+                    solver.add_constraint(element.size() | EQ(STRONG) | (area_size * ratio))?;
+                }
+                Constraint::Proportional(_) => {
+                    // given no other constraints, this segment will grow as much as possible.
+                    //
+                    // in the current implementation, this constraint will not have any effect
+                    // since in every combination of constraints, other constraints governing
+                    // element size will take a higher priority.
+                    //
+                    // this constraint is placed here only for future proofing.
+                    solver.add_constraint(element.size() | EQ(WEAK) | area_size)?;
+                }
+            }
+        }
+        // Make every `Proportional` constraint proportionally equal to each other
+        // This will make it fill up empty spaces equally
+        //
+        // [Proportional(1), Proportional(1)]
+        // ┌──────┐┌──────┐
+        // │abcdef││abcdef│
+        // └──────┘└──────┘
+        //
+        // [Proportional(1), Proportional(2)]
+        // ┌──────┐┌────────────┐
+        // │abcdef││abcdefabcdef│
+        // └──────┘└────────────┘
+        //
+        // size == base_element * scaling_factor
+        for ((&l_constraint, &l_element), (&r_constraint, &r_element)) in layout
+            .constraints
+            .iter()
+            .zip(elements.iter())
+            .filter(|(c, _)| matches!(c, Constraint::Proportional(_)))
+            .tuple_windows()
+        {
+            // `Proportional` will only expand into _excess_ available space. You can think of
+            // `Proportional` element sizes as starting from `0` and incrementally
+            // increasing while proportionally matching other `Proportional` spaces AND
+            // also meeting all other constraints.
+            if let (
+                Constraint::Proportional(l_scaling_factor),
+                Constraint::Proportional(r_scaling_factor),
+            ) = (l_constraint, r_constraint)
+            {
+                // because of the way cassowary works, we need to use `*` instead of `/`
+                // l_size / l_scaling_factor == l_size / l_scaling_factor
+                // ≡
+                // l_size * r_scaling_factor == r_size * r_scaling_factor
+                let (l_scaling_factor, r_scaling_factor) = (
+                    f64::from(l_scaling_factor).clamp(0.000001, u16::MAX as f64),
+                    f64::from(r_scaling_factor).clamp(0.000001, u16::MAX as f64),
+                );
+                solver.add_constraint(
+                    (r_scaling_factor * l_element.size())
+                        | EQ(REQUIRED - 1.0)
+                        | (l_scaling_factor * r_element.size()),
+                )?;
             }
         }
         // prefer equal chunks if other constraints are all satisfied
@@ -1211,6 +1272,289 @@ mod tests {
                     Rect::new(4, 0, 3, 1),
                 ]
             );
+        }
+
+        #[test]
+        fn proportional_fixed() {
+            // fixed doesn't panic when results don't match exactly
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Fixed(33),
+                Fixed(33),
+                Fixed(33),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [33, 33, 34]);
+
+            // cassowary implementation tends to put excess in last variable
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Fixed(25),
+                Fixed(25),
+                Fixed(25),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [25, 25, 50]);
+
+            // fixed with min and max
+            let [a, b, c] =
+                Rect::new(0, 0, 100, 1).split(&Layout::horizontal([Min(25), Fixed(25), Max(25)]));
+            assert_eq!([a.width, b.width, c.width], [50, 25, 25]);
+
+            // fixed with percent and ratio
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Percentage(25),
+                Fixed(25),
+                Ratio(1, 4),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [25, 25, 50]);
+
+            // 3 lengths for reference
+            // cassowary implementation tends to put excess in last variable
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Length(25),
+                Length(25),
+                Length(25),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [25, 25, 50]);
+
+            // fixed with length
+            // this test gives different results when run over and over again
+            //
+            // assert_eq!([a.width, b.width], [25, 50])
+            // assert_eq!([a.width, b.width], [50, 25])
+            //
+            // So we check just that the last value is what we want it to be
+            let [_a, _b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Length(25),
+                Length(25),
+                Fixed(25),
+            ]));
+            assert_eq!(c.width, 25);
+
+            // ensure that middle width is 1
+            // last length of 100 will not be met
+            let [a, b, c] =
+                Rect::new(0, 0, 50, 1).split(&Layout::horizontal([Min(20), Fixed(1), Length(100)]));
+
+            assert_eq!([a.width, b.width, c.width], [20, 1, 29]);
+
+            // ensure that middle width is 1
+            // first length of 100 will not be met
+            let [a, b, c] =
+                Rect::new(0, 0, 50, 1).split(&Layout::horizontal([Length(100), Fixed(1), Min(20)]));
+            assert_eq!([a.width, b.width, c.width], [29, 1, 20]);
+
+            // middle fixed width is satisfied exactly
+            // left and right are equal to each other
+            let [a, b, c] = Rect::new(0, 0, 50, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Fixed(10),
+                Proportional(1),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [20, 10, a.width]);
+
+            // middle fixed width is satisfied exactly
+            // ratio of left and right is 1 / 2
+            let [a, b, c] = Rect::new(0, 0, 50, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Fixed(10),
+                Proportional(2),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [13, 10, 27]);
+
+            // second width is double all the others
+            let [a, b, c, d] = Rect::new(0, 0, 50, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(2),
+                Proportional(1),
+                Proportional(1),
+            ]));
+            assert_eq!([a.width, b.width, c.width, d.width], [10, 20, 10, 10]);
+
+            // second width is still double all the others
+            let [a, b, c, d] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(2),
+                Proportional(1),
+                Proportional(1),
+            ]));
+            assert_eq!([a.width, b.width, c.width, d.width], [20, 40, 20, 20]);
+
+            // first and third widths are zero
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Proportional(1),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [0, 100, 0]);
+
+            // Proportional always divides proportionally amongst zeros
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Fixed(1),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [50, 1, 49]);
+
+            // Proportional always divides proportionally amongst zeros
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Length(1),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [50, 1, 49]);
+
+            // Proportional always divides proportionally amongst zeros
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Percentage(1),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [50, 1, 49]);
+
+            // Proportional always divides proportionally amongst zeros
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Ratio(1, 100),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [50, 1, 49]);
+
+            // Proportional always divides proportionally amongst zeros
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Min(1),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [50, 1, 49]);
+
+            // Proportional always divides proportionally amongst zeros
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Max(1),
+                Proportional(0),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [50, 1, 49]);
+
+            // first and third widths are zero
+            let [a, b, c, d] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Proportional(2),
+                Proportional(0),
+                Proportional(1),
+            ]));
+            assert_eq!([a.width, b.width, c.width, d.width], [0, 67, 0, 33]);
+
+            // 0 proportional will fill empty space
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Proportional(2),
+                Percentage(20),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [0, 80, 20]);
+
+            let [a, b] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(0),
+                Proportional(u16::MAX),
+            ]));
+            assert_eq!([a.width, b.width], [0, 100]);
+
+            // 0 proportional will fill empty space
+            let [a, b] = Rect::new(0, 0, 100, 1)
+                .split(&Layout::horizontal([Proportional(0), Percentage(20)]));
+            assert_eq!([a.width, b.width], [80, 20]);
+
+            // 1 proportional will fill empty spaces
+            let [a, b] = Rect::new(0, 0, 100, 1)
+                .split(&Layout::horizontal([Proportional(1), Percentage(20)]));
+            assert_eq!([a.width, b.width], [80, 20]);
+
+            // proportional can be zero because of high scaling factor
+            let [a, b, c] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(u16::MAX),
+                Proportional(1),
+                Percentage(20),
+            ]));
+            assert_eq!([a.width, b.width, c.width], [80, 0, 20]);
+
+            // single 0 proportional will fill empty space
+            let [a, b] =
+                Rect::new(0, 0, 100, 1).split(&Layout::horizontal([Proportional(0), Length(20)]));
+            assert_eq!([a.width, b.width], [80, 20]);
+
+            // single 0 proportional will fill empty space
+            let [a, b] =
+                Rect::new(0, 0, 100, 1).split(&Layout::horizontal([Proportional(0), Max(20)]));
+            assert_eq!([a.width, b.width], [80, 20]);
+
+            // 1 proportional will fill empty space
+            let [a, b] =
+                Rect::new(0, 0, 100, 1).split(&Layout::horizontal([Proportional(1), Max(20)]));
+            assert_eq!([a.width, b.width], [80, 20]);
+
+            // 0 min still fills empty space
+            let [a, b] =
+                Rect::new(0, 0, 100, 1).split(&Layout::horizontal([Min(0), Percentage(20)]));
+            assert_eq!([a.width, b.width], [80, 20]);
+
+            // percentage constraint doesn't hold against defying `Max`
+            let [a, b] =
+                Rect::new(0, 0, 100, 1).split(&Layout::horizontal([Max(0), Percentage(20)]));
+            assert_eq!([a.width, b.width], [0, 100]);
+
+            // specifying behavior of proportional with min and length
+            let [a, b, c, d, e] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(1),
+                Proportional(1),
+                Min(30),
+                Length(50),
+            ]));
+            assert_eq!(
+                [a.width, b.width, c.width, d.width, e.width],
+                [7, 6, 7, 30, 50]
+            );
+
+            // proportional is lower priority than length
+            let [a, b, c, d, e] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(1),
+                Proportional(1),
+                Length(50),
+                Length(50),
+            ]));
+            assert_eq!(
+                [a.width, b.width, c.width, d.width, e.width],
+                [0, 0, 0, 50, 50]
+            );
+
+            // proportional is lower priority than min and max
+            let [a, b, c, d, e] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(1),
+                Proportional(1),
+                Min(50),
+                Max(50),
+            ]));
+            assert_eq!(
+                [a.width, b.width, c.width, d.width, e.width],
+                [0, 0, 0, 50, 50]
+            );
+
+            // proportional is lower priority than percentage
+            let [a, b, c, d] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(1),
+                Proportional(1),
+                Percentage(100),
+            ]));
+            assert_eq!([a.width, b.width, c.width, d.width], [0, 0, 0, 100]);
+
+            // proportional is lower priority than ratio
+            let [a, b, c, d] = Rect::new(0, 0, 100, 1).split(&Layout::horizontal([
+                Proportional(1),
+                Proportional(1),
+                Proportional(1),
+                Ratio(1, 1),
+            ]));
+            assert_eq!([a.width, b.width, c.width, d.width], [0, 0, 0, 100]);
         }
     }
 }
