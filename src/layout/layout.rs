@@ -459,12 +459,12 @@ impl Layout {
             match constraint {
                 Constraint::Percentage(p) => {
                     let percent = f64::from(p) / 100.00;
-                    solver.add_constraint(element.size() | EQ(STRONG) | (area_size * percent))?;
+                    solver.add_constraint(element.size() | EQ(MEDIUM) | (area_size * percent))?;
                 }
                 Constraint::Ratio(n, d) => {
                     // avoid division by zero by using 1 when denominator is 0
                     let ratio = f64::from(n) / f64::from(d.max(1));
-                    solver.add_constraint(element.size() | EQ(STRONG) | (area_size * ratio))?;
+                    solver.add_constraint(element.size() | EQ(MEDIUM) | (area_size * ratio))?;
                 }
                 Constraint::Length(l) => {
                     solver.add_constraint(element.size() | EQ(STRONG) | f64::from(l))?
@@ -1177,8 +1177,8 @@ mod tests {
             assert_eq!(
                 layout[..],
                 [
-                    Rect::new(0, 0, 1, 0),
                     Rect::new(0, 0, 1, 1),
+                    Rect::new(0, 1, 1, 0),
                     Rect::new(0, 1, 1, 0)
                 ]
             );
